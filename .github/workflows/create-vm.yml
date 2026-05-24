@@ -1,9 +1,7 @@
 name: Try to Create OCI VM
-# It will run every 5 minutes.
 on:
   schedule:
     - cron: "*/5 * * * *"
-  # Allows you to manually run this workflow from the Actions tab
   workflow_dispatch:
 env:
   COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
@@ -18,6 +16,7 @@ env:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     steps:
       - name: Cache pip packages
         id: cache-pip
@@ -33,9 +32,7 @@ jobs:
         id: create_vm
         continue-on-error: true
         run: |
-          set -o pipefail
-
-          pip install --disable-pip-version-check --no-input oci-cli 2>&1 | tail -1
+          pip install --disable-pip-version-check --no-input -q oci-cli
 
           mkdir -p ~/.oci
           echo "${{ secrets.OCI_CLI_KEY_CONTENT }}" > ~/.oci/oci_api_key.pem
@@ -49,47 +46,59 @@ jobs:
           echo "region=${{ env.OCI_CLI_REGION }}" >> ~/.oci/config
           echo "${{ secrets.SSH_PUBLIC_KEY }}" > /home/runner/my_ssh_key.pub
 
-          # Try all 3 Availability Domains
           AD_LIST=("MGTi:PHX-AD-1" "MGTi:PHX-AD-2" "MGTi:PHX-AD-3")
           SUCCESS=false
+          ATTEMPT=0
+          MAX_DURATION=2700  # 45 minutes max
+          START_TIME=$(date +%s)
 
-          for AD in "${AD_LIST[@]}"; do
-            echo "=========================================="
-            echo "Trying AD: $AD"
-            echo "=========================================="
-
-            OCI_OUTPUT=$(oci compute instance launch \
-              --compartment-id "$COMPARTMENT_ID" \
-              --availability-domain "$AD" \
-              --shape "VM.Standard.A1.Flex" \
-              --shape-config '{"ocpus":4,"memoryInGBs":24}' \
-              --subnet-id "$SUBNET_ID" \
-              --image-id "$IMAGE_ID" \
-              --ssh-authorized-keys-file "/home/runner/my_ssh_key.pub" \
-              --assign-public-ip true \
-              --display-name "coolify-vm" \
-              --boot-volume-size-in-gbs 200 2>&1 || true)
-
-            echo "$OCI_OUTPUT"
-
-            if echo "$OCI_OUTPUT" | grep -q '"lifecycle-state": "PROVISIONING"'; then
-              echo "Success! Instance provisioning in $AD"
-              SUCCESS=true
+          while [ "$SUCCESS" = false ]; do
+            ELAPSED=$(( $(date +%s) - START_TIME ))
+            if [ $ELAPSED -ge $MAX_DURATION ]; then
+              echo "Timeout after ${ELAPSED}s, stopping."
               break
-            else
-              echo "Failed in $AD, trying next..."
+            fi
+
+            ATTEMPT=$((ATTEMPT + 1))
+            echo "--- Attempt #$ATTEMPT (${ELAPSED}s elapsed) ---"
+
+            for AD in "${AD_LIST[@]}"; do
+              OCI_OUTPUT=$(oci compute instance launch \
+                --compartment-id "$COMPARTMENT_ID" \
+                --availability-domain "$AD" \
+                --shape "VM.Standard.A1.Flex" \
+                --shape-config '{"ocpus":1,"memoryInGBs":6}' \
+                --subnet-id "$SUBNET_ID" \
+                --image-id "$IMAGE_ID" \
+                --ssh-authorized-keys-file "/home/runner/my_ssh_key.pub" \
+                --assign-public-ip true \
+                --display-name "coolify-vm" \
+                --boot-volume-size-in-gbs 200 2>&1 || true)
+
+              if echo "$OCI_OUTPUT" | grep -q '"lifecycle-state": "PROVISIONING"'; then
+                echo "SUCCESS in $AD on attempt #$ATTEMPT!"
+                echo "$OCI_OUTPUT"
+                SUCCESS=true
+                break
+              fi
+            done
+
+            if [ "$SUCCESS" = false ]; then
+              echo "All ADs failed, waiting 30s..."
+              sleep 30
             fi
           done
 
-          # Store the log as a GitHub step output
+          # Store output
           echo "log_data<<EOF" >> $GITHUB_OUTPUT
+          echo "Attempts: $ATTEMPT, Success: $SUCCESS" >> $GITHUB_OUTPUT
           echo "$OCI_OUTPUT" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
           if [ "$SUCCESS" = true ]; then
             exit 0
           else
-            echo "Error: Could not create instance in any AD."
+            echo "Error: Could not create instance after $ATTEMPT attempts."
             exit 1
           fi
 
@@ -102,10 +111,7 @@ jobs:
           status: ${{ steps.create_vm.outcome }}
           color: ${{ steps.create_vm.outcome == 'success' && '0x28a745' || '0xdc3545' }}
           description: |
-            Attempt to create A1.Flex VM (tried AD-1, AD-2, AD-3).
             **Status:** `${{ steps.create_vm.outcome }}`
-
-            **Log Output:**
-            ```json
+            ```
             ${{ steps.create_vm.outputs.log_data }}
             ```
