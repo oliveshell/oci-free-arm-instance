@@ -85,7 +85,7 @@ jobs:
 
             if [ "$SUCCESS" = false ]; then
               echo "All ADs failed, waiting 30s..."
-              sleep 30
+              sleep 10
             fi
           done
 
